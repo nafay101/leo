@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field, ValidationError
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-DEFAULT_MODEL = "gemini-3.6-flash"  # override with the GEMINI_MODEL secret / env var
+DEFAULT_MODEL = "gemini-3.5-flash"  # override with the GEMINI_MODEL secret / env var
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 30_000
 MAX_JD_CHARS = 10_000

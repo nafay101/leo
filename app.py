@@ -27,6 +27,22 @@ MAX_RESUME_CHARS = 30_000
 MAX_JD_CHARS = 10_000
 MIN_RESUME_CHARS = 150
 
+# Files Gemini can read directly when text extraction fails (scans, images, designed PDFs)
+FALLBACK_MIME = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+
+def fallback_mime(filename: str) -> Optional[str]:
+    name = filename.lower()
+    for ext, mime in FALLBACK_MIME.items():
+        if name.endswith(ext):
+            return mime
+    return None
+
 
 # --------------------------------------------------------------------------- #
 # Response schema (what we ask Gemini to return)
@@ -121,12 +137,24 @@ apparent target role.
 - All scores are integers from 0 to 100."""
 
 
-def build_prompt(resume_text: str, job_description: Optional[str]) -> str:
+def build_prompt(
+    resume_text: str, job_description: Optional[str], from_file: bool = False
+) -> str:
     jd_block = (
         f"<job_description>\n{job_description}\n</job_description>"
         if job_description
         else "<job_description>Not provided. Evaluate against the apparent target role.</job_description>"
     )
+    if from_file:
+        return (
+            "The resume is attached as a file (a scan, image or heavily designed document "
+            "whose text a standard ATS text parser could NOT extract). Read it directly and "
+            "evaluate it. Because an ATS could not parse it, give "
+            "formatting_and_parseability a score of 40 or lower and include a High-priority "
+            "improvement explaining that the resume must be exported as a text-based "
+            "PDF or DOCX.\n\n"
+            f"{jd_block}"
+        )
     return (
         "Evaluate the resume below for ATS compatibility and quality.\n\n"
         f"<resume>\n{resume_text}\n</resume>\n\n{jd_block}"
@@ -143,12 +171,23 @@ def analyze_resume(
     resume_text: str,
     job_description: Optional[str] = None,
     client: Optional[genai.Client] = None,
+    file_part: Optional[tuple] = None,
 ) -> ATSResult:
-    """Call Gemini and return a validated ATSResult."""
+    """Call Gemini and return a validated ATSResult.
+
+    If ``file_part`` is given as ``(bytes, mime_type)``, the file itself is sent to
+    Gemini (which can read scanned PDFs and images) instead of extracted text.
+    """
     client = client or genai.Client(api_key=api_key)
+    prompt = build_prompt(resume_text, job_description, from_file=file_part is not None)
+    if file_part is not None:
+        data, mime = file_part
+        contents = [types.Part.from_bytes(data=data, mime_type=mime), prompt]
+    else:
+        contents = prompt
     response = client.models.generate_content(
         model=model,
-        contents=build_prompt(resume_text, job_description),
+        contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
             response_mime_type="application/json",
@@ -316,7 +355,10 @@ def main() -> None:
             "stored by this app."
         )
 
-    uploaded = st.file_uploader("Resume (PDF, DOCX or TXT)", type=["pdf", "docx", "txt"])
+    uploaded = st.file_uploader(
+        "Resume (PDF, DOCX, TXT, or a PNG/JPG scan)",
+        type=["pdf", "docx", "txt", "png", "jpg", "jpeg"],
+    )
     job_description = st.text_area(
         "Job description (optional)",
         height=160,
@@ -333,32 +375,51 @@ def main() -> None:
             st.error(f"File is larger than {MAX_FILE_MB} MB.")
             st.stop()
 
-        try:
-            text = extract_text(data, uploaded.name)
-        except Exception as exc:
-            st.error(f"Could not read the file: {exc}")
-            st.stop()
+        mime = fallback_mime(uploaded.name)
+        is_image = mime is not None and mime.startswith("image/")
 
+        text = ""
+        if not is_image:
+            try:
+                text = extract_text(data, uploaded.name)
+            except Exception as exc:
+                if mime is None:  # DOCX/TXT that we cannot read at all
+                    st.error(f"Could not read the file: {exc}")
+                    st.stop()
+                text = ""  # PDF failed to parse -> try the file fallback below
+
+        file_part = None
         if len(text) < MIN_RESUME_CHARS:
-            st.error(
-                "Very little text could be extracted. If your resume is a scanned image "
-                "or heavily designed PDF, that is itself an ATS problem - export a "
-                "text-based PDF or DOCX and try again."
-            )
-            st.stop()
+            if mime is None:
+                st.error(
+                    "Very little text could be extracted from this file. Make sure the "
+                    "resume text is real text (not images or text boxes), or upload it as "
+                    "a PDF or PNG/JPG so it can be read directly."
+                )
+                st.stop()
+            file_part = (data, mime)  # let Gemini read the scan / image itself
 
         text = text[:MAX_RESUME_CHARS]
         jd = job_description.strip()[:MAX_JD_CHARS] or None
 
         with st.spinner("Analyzing your resume..."):
             try:
-                st.session_state["result"] = analyze_resume(api_key, model, text, jd)
+                st.session_state["result"] = analyze_resume(
+                    api_key, model, text, jd, file_part=file_part
+                )
+                st.session_state["read_from_file"] = file_part is not None
             except Exception as exc:
                 st.session_state.pop("result", None)
                 st.error(f"Analysis failed: {exc}")
                 st.stop()
 
     if "result" in st.session_state:
+        if st.session_state.get("read_from_file"):
+            st.warning(
+                "No selectable text could be extracted from this file, so it was read "
+                "directly by the AI. Most ATS systems cannot read scanned or image-only "
+                "resumes, so export a text-based PDF or DOCX before applying."
+            )
         render_result(st.session_state["result"])
 
 
